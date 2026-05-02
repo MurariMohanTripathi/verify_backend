@@ -1,6 +1,89 @@
 import News from "../models/News.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+const PASSING_SCORE = 50;
+const MODERATION_MODEL = "gemini-flash-latest";
+
+const extractJson = (value) => {
+  const cleaned = value.replace(/```json/g, "").replace(/```/g, "").trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+
+  if (start === -1 || end === -1) {
+    throw new Error("Gemini did not return JSON.");
+  }
+
+  return JSON.parse(cleaned.slice(start, end + 1));
+};
+
+const clampScore = (score) => {
+  const number = Number(score);
+  if (Number.isNaN(number)) return 0;
+  return Math.max(0, Math.min(100, Math.round(number)));
+};
+
+const moderateSubmission = async ({ title, url, source }) => {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not configured.");
+  }
+
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({ model: MODERATION_MODEL });
+
+  const prompt = `
+    You are a strict moderation and credibility gatekeeper for a public news verification platform.
+    Analyze this user-submitted news claim before it is allowed into the community panel.
+
+    Submission:
+    Title/claim: "${title}"
+    Source/platform: "${source || "Not provided"}"
+    URL: "${url || "Not provided"}"
+
+    Reject low-quality random text, spam, unrelated content, pornography or sexual content, abusive language, hate/harassment, violent threats, criminal instructions, scams, doxxing, and claims that are clearly fabricated or not credible enough for public voting.
+
+    Return only a JSON object with this exact shape:
+    {
+      "credibilityScore": <number 0-100>,
+      "safetyScore": <number 0-100>,
+      "isFakeOrMisleading": <boolean>,
+      "hasAbuseOrHarassment": <boolean>,
+      "hasPornographicContent": <boolean>,
+      "hasCriminalOrViolentContent": <boolean>,
+      "isSpamOrNonsense": <boolean>,
+      "decision": "approve" | "reject",
+      "reason": "<short user-facing reason>"
+    }
+  `;
+
+  const result = await model.generateContent(prompt);
+  const aiData = extractJson(result.response.text());
+  const credibilityScore = clampScore(aiData.credibilityScore);
+  const safetyScore = clampScore(aiData.safetyScore);
+  const blockedFlags = [
+    aiData.isFakeOrMisleading,
+    aiData.hasAbuseOrHarassment,
+    aiData.hasPornographicContent,
+    aiData.hasCriminalOrViolentContent,
+    aiData.isSpamOrNonsense,
+  ].some(Boolean);
+
+  const approved =
+    aiData.decision === "approve" &&
+    credibilityScore >= PASSING_SCORE &&
+    safetyScore >= PASSING_SCORE &&
+    !blockedFlags;
+
+  return {
+    approved,
+    credibilityScore,
+    safetyScore,
+    reason:
+      aiData.reason ||
+      (approved
+        ? "Submission passed moderation."
+        : "Submission did not meet the platform moderation standards."),
+  };
+};
 
 // const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -8,13 +91,55 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 export const submitNews = async (req, res) => {
   try {
     const { title, url, source, submittedBy } = req.body;
+    const submitterName =
+      submittedBy ||
+      req.user?.name ||
+      req.user?.email ||
+      "Anonymous";
 
     if (!title) {
       return res.status(400).json({ message: "Title is required" });
     }
 
-    const news = await News.create({ title, url, source, submittedBy });
-    res.status(201).json(news);
+    const moderation = await moderateSubmission({ title, url, source });
+    if (!moderation.approved) {
+      return res.status(422).json({
+        message: moderation.reason,
+        moderation,
+      });
+    }
+
+    const news = await News.create({
+      title,
+      url,
+      source,
+      submittedBy: submitterName,
+      submittedByUid: req.user?.uid,
+      submittedByEmail: req.user?.email,
+      moderation: {
+        credibilityScore: moderation.credibilityScore,
+        safetyScore: moderation.safetyScore,
+        summary: moderation.reason,
+        checkedAt: new Date(),
+      },
+    });
+
+    res.status(201).json({
+      news,
+      moderation,
+      message: "News submitted after AI moderation.",
+    });
+  } catch (error) {
+    console.error("Submit moderation error:", error);
+    res.status(500).json({ message: "Unable to moderate this submission right now." });
+  }
+};
+
+// Get news submitted by the logged-in user
+export const getMyNews = async (req, res) => {
+  try {
+    const myNews = await News.find({ submittedByUid: req.user.uid }).sort({ createdAt: -1 });
+    res.json(myNews);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -23,8 +148,19 @@ export const submitNews = async (req, res) => {
 // Get all news
 export const getNews = async (req, res) => {
   try {
-    const allNews = await News.find().sort({ createdAt: -1 });
-    res.json(allNews);
+    const query = req.user ? News.find().select("+voterChoices") : News.find();
+    const allNews = await query.sort({ createdAt: -1 });
+
+    res.json(
+      allNews.map((newsItem) => {
+        const item = newsItem.toObject();
+        item.currentUserVote = req.user
+          ? newsItem.voterChoices?.get(req.user.uid) || null
+          : null;
+        delete item.voterChoices;
+        return item;
+      })
+    );
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -35,21 +171,43 @@ export const voteNews = async (req, res) => {
   try {
     const { id } = req.params;
     const { type } = req.body; // "true", "false", "review"
+    const userId = req.user.uid;
 
     // Check if voting type is valid
     if (!["true", "false", "review"].includes(type)) {
       return res.status(400).json({ message: "Invalid vote type" });
     }
 
-    const newsItem = await News.findById(id);
+    const newsItem = await News.findById(id).select("+voterChoices");
     if (!newsItem) {
       return res.status(404).json({ message: "News not found" });
     }
 
-    newsItem.votes[type] += 1;
+    if (!newsItem.voterChoices) {
+      newsItem.voterChoices = new Map();
+    }
+
+    const previousVote = newsItem.voterChoices.get(userId);
+
+    if (previousVote === type) {
+      newsItem.voterChoices.delete(userId);
+      newsItem.votes[type] = Math.max((newsItem.votes[type] || 0) - 1, 0);
+    } else {
+      if (previousVote) {
+        newsItem.votes[previousVote] = Math.max((newsItem.votes[previousVote] || 0) - 1, 0);
+      }
+
+      newsItem.voterChoices.set(userId, type);
+      newsItem.votes[type] = (newsItem.votes[type] || 0) + 1;
+    }
+
     await newsItem.save();
 
-    res.json({ success: true, news: newsItem });
+    const responseNews = newsItem.toObject();
+    responseNews.currentUserVote = newsItem.voterChoices.get(userId) || null;
+    delete responseNews.voterChoices;
+
+    res.json({ success: true, news: responseNews });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -136,6 +294,7 @@ export const chatAboutNews = async (req, res) => {
     res.status(500).json({ error: "Failed to connect to AI chat." });
   }
 };
+
 
 
 // Inside your factCheckNews function in backend/controllers/newsController.js
