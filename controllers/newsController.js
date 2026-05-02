@@ -1,8 +1,10 @@
 import News from "../models/News.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import axios from "axios";
 
 const PASSING_SCORE = 50;
 const MODERATION_MODEL = "gemini-flash-latest";
+const NEWS_API_URL = "https://newsapi.org/v2/top-headlines";
 
 const extractJson = (value) => {
   const cleaned = value.replace(/```json/g, "").replace(/```/g, "").trim();
@@ -163,6 +165,30 @@ export const getNews = async (req, res) => {
     );
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+};
+
+// Proxy public headlines through the backend so Firebase-hosted clients do not
+// call NewsAPI directly from the browser.
+export const getHeadlines = async (_req, res) => {
+  try {
+    const apiKey = process.env.NEWS_API_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({ message: "NEWS_API_KEY is not configured." });
+    }
+
+    const response = await axios.get(NEWS_API_URL, {
+      params: {
+        country: "us",
+        apiKey,
+      },
+    });
+
+    res.json(response.data.articles || []);
+  } catch (error) {
+    console.error("NewsAPI headlines error:", error.response?.data || error.message);
+    res.status(502).json({ message: "Unable to fetch headlines right now." });
   }
 };
 
